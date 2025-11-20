@@ -2,91 +2,100 @@ import streamlit as st
 import paramiko
 from scp import SCPClient
 import json
+import requests
 
 # ------------------------------------------------------
-# CONFIG (read from Streamlit secrets)
+# CONFIG
 # ------------------------------------------------------
-REMOTE_USER = st.secrets["ssh"]["REMOTE_USER"]
-REMOTE_HOST = st.secrets["ssh"]["REMOTE_HOST"]
-REMOTE_SSH_PORT = int(st.secrets["ssh"]["REMOTE_SSH_PORT"])
-REMOTE_DIR = st.secrets["ssh"]["REMOTE_DIR"]
-ASR_SERVER_INTERNAL_IP = st.secrets["ssh"]["ASR_SERVER_INTERNAL_IP"]
-SSH_PASSWORD = st.secrets["ssh"]["SSH_PASSWORD"]
-DEFAULT_PORT = int(st.secrets["ssh"]["DEFAULT_PORT"])
+REMOTE_USER = st.secrets.get("REMOTE_USER", "o-health")
+REMOTE_HOST = st.secrets.get("REMOTE_HOST", "49.204.152.240")
+REMOTE_SSH_PORT = int(st.secrets.get("REMOTE_SSH_PORT", 1234))
+REMOTE_DIR = st.secrets.get("REMOTE_DIR", "~/Downloads/Debosmit/Audio/Dogri")
+ASR_SERVER_INTERNAL_IP = st.secrets.get("ASR_SERVER_INTERNAL_IP", "192.168.0.101")
+DEFAULT_PORT = int(st.secrets.get("DEFAULT_PORT", 5005))
+SSH_PASSWORD = st.secrets.get("SSH_PASSWORD", "123456789")
 # ------------------------------------------------------
-
-
-st.set_page_config(page_title="Dogri ASR (M4 Server)", page_icon="🎧")
 
 st.title("🎧 ASR Transcription & Translation (M4 Server)")
-st.write(
-    "Upload a `.wav` file. It will be sent to the M4 Max server over SSH, "
-    "then processed by your ASR API running inside the M4 network."
+st.write("Upload audio or record using your mic to transcribe & translate using your remote ASR server.")
+
+# ------------------------------------------------------------------
+#  INPUT MODE SELECTOR
+# ------------------------------------------------------------------
+mode = st.radio(
+    "Choose Audio Input Method",
+    ["Upload WAV File", "Record using Microphone"]
 )
 
-uploaded_file = st.file_uploader("Upload WAV file", type=["wav"])
+uploaded_file = None
+recorded_audio = None
 
-port = st.number_input("ASR Model Port", value=DEFAULT_PORT, step=1)
+if mode == "Upload WAV File":
+    uploaded_file = st.file_uploader("Upload WAV file", type=["wav"])
 
-def run_remote_asr(file_obj, filename: str, port: int):
-    # Ensure file pointer is at the beginning
-    file_obj.seek(0)
+elif mode == "Record using Microphone":
+    recorded_audio = st.audio_input("Record audio")
 
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+port = st.number_input("ASR Model Port", value=DEFAULT_PORT)
 
-    ssh.connect(
-        hostname=REMOTE_HOST,
-        port=REMOTE_SSH_PORT,
-        username=REMOTE_USER,
-        password=SSH_PASSWORD,
-        timeout=30
-    )
+# ------------------------------------------------------------------
+#  PROCESS FILE
+# ------------------------------------------------------------------
+if (uploaded_file or recorded_audio) and st.button("Run Transcription"):
+    
+    # Determine filename + file data
+    if uploaded_file:
+        file_obj = uploaded_file
+        filename = uploaded_file.name
 
-    try:
-        # Upload file via SCP
-        with SCPClient(ssh.get_transport()) as scp:
-            remote_path = f"{REMOTE_DIR}/{filename}"
-            scp.putfo(file_obj, remote_path)
+    elif recorded_audio:
+        file_obj = recorded_audio
+        filename = "mic_recording.wav"
 
-        # Build curl command to call ASR API from inside M4
-        curl_command = (
-            f"cd {REMOTE_DIR} && "
-            f"curl -s -X POST http://{ASR_SERVER_INTERNAL_IP}:{port}/convertSpeechToText "
-            f"-H 'Content-Type: application/json' "
-            f"-d '{{\"audioFileName\":\"{filename}\"}}'"
+    st.write(f"**File selected:** {filename}")
+
+    # ------------------------------
+    # Upload to remote server
+    # ------------------------------
+    with st.spinner("Uploading to M4 Max server..."):
+
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            hostname=REMOTE_HOST,
+            port=REMOTE_SSH_PORT,
+            username=REMOTE_USER,
+            password=SSH_PASSWORD
         )
 
-        stdin, stdout, stderr = ssh.exec_command(curl_command)
-        result = stdout.read().decode().strip()
-        error_output = stderr.read().decode().strip()
+        # Upload using SCP
+        with SCPClient(ssh.get_transport()) as scp:
+            scp.putfo(file_obj, f"{REMOTE_DIR}/{filename}")
 
-        return result, error_output
-    finally:
-        ssh.close()
+    st.success("File uploaded successfully!")
 
+    # ------------------------------
+    # Run ASR via SSH + CURL
+    # ------------------------------
+    st.info("Running ASR on the remote server...")
 
-if uploaded_file is not None:
-    filename = uploaded_file.name
-    st.write(f"**File selected:** `{filename}`")
+    curl_command = (
+        f"cd {REMOTE_DIR} && "
+        f"curl -s -X POST http://{ASR_SERVER_INTERNAL_IP}:{port}/convertSpeechToText "
+        f"-H 'Content-Type: application/json' "
+        f"-d '{{\"audioFileName\":\"Dogri/{filename}\"}}'"
+    )
 
-    if st.button("Run Transcription"):
-        with st.spinner("Uploading to M4 Max server and running ASR..."):
-            try:
-                result, err = run_remote_asr(uploaded_file, filename, int(port))
+    stdin, stdout, stderr = ssh.exec_command(curl_command)
+    result = stdout.read().decode().strip()
+    ssh.close()
 
-                if err:
-                    st.warning("Remote stderr output:")
-                    st.code(err)
-
-                # Try to parse JSON
-                try:
-                    parsed = json.loads(result)
-                    st.success("ASR result received:")
-                    st.json(parsed)
-                except json.JSONDecodeError:
-                    st.error("Failed to parse JSON. Raw output:")
-                    st.code(result or "(empty response)")
-
-            except Exception as e:
-                st.error(f"Error communicating with remote server: {e}")
+    # ------------------------------
+    # Display JSON response
+    # ------------------------------
+    try:
+        parsed = json.loads(result)
+        st.json(parsed)
+    except:
+        st.error("Failed to parse JSON")
+        st.text(result)
